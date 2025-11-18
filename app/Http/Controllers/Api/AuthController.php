@@ -3,13 +3,17 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\OneTimeToken;
 use App\Models\RefreshToken;
 use App\Models\User;
-use GuzzleHttp\Client;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
-use Laravel\Socialite\Facades\Socialite;
 
 class AuthController extends Controller
 {
@@ -17,59 +21,52 @@ class AuthController extends Controller
 
     // -----------------------------------
 
-    public function signin(Request $request) {}
-
-    // -----------------------------------
-
-    public function githubRedirect(Request $request)
+    public function signin(Request $request)
     {
-        return Socialite::driver('github')->redirect();
-    }
-
-    // -----------------------------------
-
-    public function githubCallback(Request $request)
-    {
+        $validator = Validator::make($request->all(), [
+            'username' => 'required|exists:users,email',
+            'password' => 'required'
+        ], [
+            'username.required' => 'Username is required',
+            'username.exists'   => 'User does not exist',
+            'password.required' => 'Password is required'
+        ]);
+        if ($validator->fails()) {
+            return response()->json(['errors' => $validator->errors()], Response::HTTP_UNPROCESSABLE_ENTITY);
+        }
         try {
             DB::beginTransaction();
 
-            $githubUser = Socialite::driver('github')
-                ->setHttpClient(new Client([
-                    'verify' => false
-                ]))
-                ->user();
-
-            $user = User::updateOrCreate(
-                [
-                    'email' => $githubUser->getEmail()
-                ],
-                [
-                    'name' => $githubUser->getName(),
-                    'email' => $githubUser->getEmail(),
-                    'social_type' => 'github',
-                    'social_id' => $githubUser->getId(),
-                ]
-            );
-
+            if (!Auth::attempt(['email' => $request->username, 'password' => $request->password])) {
+                return response()->json(['errors' => ['Incorrect credentials']], Response::HTTP_UNAUTHORIZED);
+            }
+            $user = Auth::user();
             $tokenResult = $user->createToken('AuthToken');
             $accessToken = $tokenResult->accessToken;
-            $refreshToken = $tokenResult->token->id;
-            $expiresAt = $tokenResult->token->expires_at;
+            $tokenModel = $tokenResult->token;
+            $tokenId = (string) $tokenModel->id;
+            $expiresAt = $tokenModel->expires_at ?? Carbon::now()->addMinutes(5);
+            $refreshToken = Str::random(64);
             $name = config('lookup.REFRESH_TOKEN_NAME');
 
             RefreshToken::create([
                 'user_id' => $user->id,
                 'token' => hash('sha256', $refreshToken),
-                'expires_at' => $expiresAt,
                 'revoked' => false,
+                'expires_at' => now()->addDays(3),
             ]);
 
-            DB::commit();
+            $oneTimeToken = Str::random(64);
+            OneTimeToken::create([
+                'user_id' => $user->id,
+                'token_id' => $oneTimeToken,
+                'status' => 'active',
+            ]);
 
             $refreshCookie = cookie(
                 $name,              // name
                 $refreshToken,      // value
-                60 * 24 * 15,       // expiry in minutes (15 days)
+                60 * 24 * 30,       // expiry in minutes (30 days)
                 '/api',             // path
                 null,               // domain (null = current)
                 false,              // secure (set true in HTTPS)
@@ -78,10 +75,21 @@ class AuthController extends Controller
                 'Lax'               // SameSite (important for cross-origin React app)
             );
 
-            return redirect('http://localhost:5173/admin/authenticating')->cookie($refreshCookie);
+            $responseData = [
+                'data' => $user,
+                'token' => $accessToken,
+                'token_type' => 'Bearer',
+                'expires_in' => $expiresAt, // 15 minutes in seconds
+                'one_time_pass' => $oneTimeToken,
+            ];
+
+            DB::commit();
+
+            return response()->json($responseData, Response::HTTP_OK)->cookie($refreshCookie);
         } catch (\Throwable $th) {
+            Log::error('Login error: ', $th->getMessage());
             DB::rollBack();
-            return response()->json(['error' => 'Authentication failed'], 500);
+            return response()->json(['error' => 'Login failed'], Response::HTTP_INTERNAL_SERVER_ERROR);
         }
     }
 
@@ -103,6 +111,7 @@ class AuthController extends Controller
                 ->where('revoked', false)
                 ->where('expires_at', '>', now())
                 ->first();
+            Log::info('Created refresh token: ' . ($stored ? $stored->id : 'null'));
 
             if (!$stored) {
                 return response()->json(['error' => 'Unauthenticated'], 401);
@@ -116,19 +125,18 @@ class AuthController extends Controller
             $tokenResult = $user->createToken('AuthToken');
             $tokenModel = $tokenResult->token;
             $expiresAt = $tokenModel->expires_at ?? now()->addMinutes(5);
+
             $newRefreshToken = Str::random(64);
             RefreshToken::whereId($stored->id)->update([
                 'token'      => hash('sha256', $newRefreshToken),
                 'expires_at' => $expiresAt,
             ]);
 
-            DB::commit();
-
             $refreshCookie = cookie(
                 $name,
                 $newRefreshToken,
-                60 * 24 * 15,
-                '/api',
+                60 * 24 * 30,
+                '/',
                 null,
                 false,
                 true,
@@ -136,19 +144,71 @@ class AuthController extends Controller
                 'Lax'
             );
 
+            DB::commit();
+
             return response()->json([
                 'data'        => $user,
                 'token'       => $tokenResult->accessToken,
                 'token_type'  => 'Bearer',
-                'expires_in'  => 15 * 60,
+                'expires_in'  => $expiresAt,
             ])->cookie($refreshCookie);
         } catch (\Throwable $th) {
             DB::rollBack();
+            Log::error('Token refresh error: ' . $th->getMessage());
             return response()->json(['error' => 'Token refresh failed'], 500);
         }
     }
 
     // -----------------------------------
 
-    public function signout(Request $request) {}
+    public function deleteOneTimeToken($token)
+    {
+        $check = OneTimeToken::where('token_id', $token)->where('status', 'active')->first();
+        if ($check) {
+            OneTimeToken::where('token_id', $token)->update(['status' => 'used']);
+            return response()->json(['message' => 'success'], Response::HTTP_OK);
+        } else {
+            return response()->json(['errors' => ['Token not found']], Response::HTTP_UNAUTHORIZED);
+        }
+    }
+
+    // -----------------------------------
+
+    public function signout(Request $request)
+    {
+        $name = config('lookup.REFRESH_TOKEN_NAME');
+        $refreshToken = $request->cookie($name);
+        if ($refreshToken) {
+            RefreshToken::where('token', hash('sha256', $refreshToken))
+                ->where('revoked', false)
+                ->update(['revoked' => true]);
+            RefreshToken::where('token', hash('sha256', $refreshToken))->delete();
+        }
+        $request->user()->token()->revoke();
+        $cookieName = config('lookup.REFRESH_TOKEN_NAME');
+        $forgetCookie = cookie()->forget($cookieName, '/api', null, false, true, false, 'Lax');
+
+        return response()->json(['message' => 'Logged out successfully'])
+            ->withCookie($forgetCookie);
+    }
+
+    // -----------------------------------
+
+    public function me(Request $request) {}
+
+    // -----------------------------------
+
+    public function changePassword(Request $request) {}
+
+    // -----------------------------------
+
+    public function profileUpdate(Request $request) {}
+
+    // -----------------------------------
+
+    public function githubRedirect() {}
+
+    // -----------------------------------
+
+    public function githubCallback() {}
 }
