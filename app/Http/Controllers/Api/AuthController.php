@@ -44,7 +44,6 @@ class AuthController extends Controller
             $tokenResult = $user->createToken('AuthToken');
             $accessToken = $tokenResult->accessToken;
             $tokenModel = $tokenResult->token;
-            $tokenId = (string) $tokenModel->id;
             $expiresAt = $tokenModel->expires_at ?? Carbon::now()->addMinutes(5);
             $refreshToken = Str::random(64);
             $name = config('lookup.REFRESH_TOKEN_NAME');
@@ -63,18 +62,6 @@ class AuthController extends Controller
                 'status' => 'active',
             ]);
 
-            $refreshCookie = cookie(
-                $name,              // name
-                $refreshToken,      // value
-                60 * 24 * 30,       // expiry in minutes (30 days)
-                '/api',             // path
-                null,               // domain (null = current)
-                false,              // secure (set true in HTTPS)
-                true,               // httpOnly
-                false,              // raw
-                'Lax'               // SameSite (important for cross-origin React app)
-            );
-
             $responseData = [
                 'data' => $user,
                 'token' => $accessToken,
@@ -85,7 +72,17 @@ class AuthController extends Controller
 
             DB::commit();
 
-            return response()->json($responseData, Response::HTTP_OK)->cookie($refreshCookie);
+            return response()->json($responseData, Response::HTTP_OK)->cookie(
+                $name,
+                $refreshToken,
+                60 * 24 * 30,
+                '/',
+                null,
+                false,
+                true,
+                false,
+                'Lax'
+            );
         } catch (\Throwable $th) {
             Log::error('Login error: ', $th->getMessage());
             DB::rollBack();
@@ -132,7 +129,14 @@ class AuthController extends Controller
                 'expires_at' => $expiresAt,
             ]);
 
-            $refreshCookie = cookie(
+            DB::commit();
+
+            return response()->json([
+                'data'        => $user,
+                'token'       => $tokenResult->accessToken,
+                'token_type'  => 'Bearer',
+                'expires_in'  => $expiresAt,
+            ])->cookie(
                 $name,
                 $newRefreshToken,
                 60 * 24 * 30,
@@ -143,15 +147,6 @@ class AuthController extends Controller
                 false,
                 'Lax'
             );
-
-            DB::commit();
-
-            return response()->json([
-                'data'        => $user,
-                'token'       => $tokenResult->accessToken,
-                'token_type'  => 'Bearer',
-                'expires_in'  => $expiresAt,
-            ])->cookie($refreshCookie);
         } catch (\Throwable $th) {
             DB::rollBack();
             Log::error('Token refresh error: ' . $th->getMessage());
@@ -186,7 +181,8 @@ class AuthController extends Controller
         }
         $request->user()->token()->revoke();
         $cookieName = config('lookup.REFRESH_TOKEN_NAME');
-        $forgetCookie = cookie()->forget($cookieName, '/api', null, false, true, false, 'Lax');
+        Log::info('Cookie name: ' . $cookieName);
+        $forgetCookie = cookie()->forget($cookieName, '/', null, false, true, false, 'Lax');
 
         return response()->json(['message' => 'Logged out successfully'])
             ->withCookie($forgetCookie);
@@ -208,12 +204,4 @@ class AuthController extends Controller
     // -----------------------------------
 
     public function profileUpdate(Request $request) {}
-
-    // -----------------------------------
-
-    public function githubRedirect() {}
-
-    // -----------------------------------
-
-    public function githubCallback() {}
 }
