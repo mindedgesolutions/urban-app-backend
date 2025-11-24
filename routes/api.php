@@ -6,7 +6,8 @@ use Illuminate\Support\Facades\Route;
 
 Route::controller(AuthController::class)->prefix('auth')->group(function () {
     Route::post('sign-up', 'signup');
-    Route::post('sign-in', 'signin');
+    Route::post('login', 'login');
+    Route::post('mobile-login', 'mobileLogin');
     Route::post('refresh-token', 'refreshToken');
     Route::post('delete-one-time-token/{token}', 'deleteOneTimeToken');
 });

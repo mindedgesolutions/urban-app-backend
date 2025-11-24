@@ -21,7 +21,7 @@ class AuthController extends Controller
 
     // -----------------------------------
 
-    public function signin(Request $request)
+    public function login(Request $request)
     {
         $validator = Validator::make($request->all(), [
             'username' => 'required|exists:users,email',
@@ -83,6 +83,68 @@ class AuthController extends Controller
                 false,
                 'Lax'
             );
+        } catch (\Throwable $th) {
+            Log::error('Login error: ', $th->getMessage());
+            DB::rollBack();
+            return response()->json(['error' => 'Login failed'], Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    // -----------------------------------
+
+    public function mobileLogin(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'username' => 'required|exists:users,email',
+            'password' => 'required'
+        ], [
+            'username.required' => 'Username is required',
+            'username.exists'   => 'User does not exist',
+            'password.required' => 'Password is required'
+        ]);
+        if ($validator->fails()) {
+            return response()->json(['errors' => $validator->errors()], Response::HTTP_UNPROCESSABLE_ENTITY);
+        }
+        try {
+            DB::beginTransaction();
+
+            if (!Auth::attempt(['email' => $request->username, 'password' => $request->password])) {
+                return response()->json(['errors' => ['Incorrect credentials']], Response::HTTP_UNAUTHORIZED);
+            }
+            $user = Auth::user();
+            $tokenResult = $user->createToken('AuthToken');
+            $accessToken = $tokenResult->accessToken;
+            $tokenModel = $tokenResult->token;
+            $expiresAt = $tokenModel->expires_at ?? Carbon::now()->addMinutes(5);
+            $refreshToken = Str::random(64);
+            $name = config('lookup.REFRESH_TOKEN_NAME');
+
+            RefreshToken::create([
+                'user_id' => $user->id,
+                'token' => hash('sha256', $refreshToken),
+                'revoked' => false,
+                'expires_at' => now()->addDays(3),
+            ]);
+
+            $oneTimeToken = Str::random(64);
+            OneTimeToken::create([
+                'user_id' => $user->id,
+                'token_id' => $oneTimeToken,
+                'status' => 'active',
+            ]);
+
+            $responseData = [
+                'data' => $user,
+                'token' => $accessToken,
+                'token_type' => 'Bearer',
+                'expires_in' => $expiresAt, // 15 minutes in seconds
+                'one_time_pass' => $oneTimeToken,
+                'refresh_token' => $refreshToken,
+            ];
+
+            DB::commit();
+
+            return response()->json($responseData, Response::HTTP_OK);
         } catch (\Throwable $th) {
             Log::error('Login error: ', $th->getMessage());
             DB::rollBack();
